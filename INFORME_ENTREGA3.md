@@ -553,6 +553,33 @@ Se seleccionó una **Arquitectura Híbrida de Dos Capas**:
 1. **Capa de Control e Intervención en Memoria (LKM `sec_mmap`):** Maneja la seguridad estructural del VMA, la paginación por demanda (`.fault`), la detección de escrituras ilegítimas (`.page_mkwrite`) y el cifrado transparente.
 2. **Capa de Auditoría y Detección Pasiva (eBPF):** Supervisa el flujo global de llamadas `mmap()` del sistema operativo en tiempo real a velocidad de silicio sin modificar el código fuente del núcleo.
 
+### Diagrama de arquitectura
+
+```mermaid
+flowchart TD
+    subgraph Espacio_Usuario ["Espacio de Usuario (Ring 3)"]
+        A[Proceso de Aplicación] -->|1. mmap| B[Llamada al Sistema sys_mmap]
+        A -->|4. MOV / Lectura| C["Acceso Directo MMU (PTE Activa)"]
+        D[PoC 1: Evasión POSIX]
+        E[PoC 2: Carrera madvise/COW]
+        F[PoC 3: Cifrado e Integridad]
+        G[Benchmark Cuantitativo]
+    end
+
+    subgraph Frontera_Seguridad ["Frontera de Seguridad Hardware / CPU"]
+        B -->|Trap a Ring 0| H[Sub-sistema de Memoria Virtual Linux]
+        C -.->|Page Fault #PF| I[Controlador de Excepciones exc_page_fault]
+    end
+
+    subgraph Capa_Kernel ["Capa de Kernel (Ring 0)"]
+        H -->|Hook VMA| J["sec_dev_mmap: Validación de Políticas y Credenciales UID/GID"]
+        I -->|do_fault| K["sec_vma_fault: Paginación por Demanda y Descifrado en Caliente"]
+        I -->|do_wp_page| L["sec_vma_page_mkwrite: Control de Dirtying e Integridad COW"]
+        M["Sonda eBPF: trace_sys_enter_mmap"] -->|Ring Buffer| N[Monitor de Auditoria]
+        J --> O["/proc/sec_mmap_status (Telemetría de Seguridad)"]
+    end
+```
+
 ### Matriz de Compensaciones (*Trade-Offs*): Rendimiento vs. Seguridad
 
 ```
