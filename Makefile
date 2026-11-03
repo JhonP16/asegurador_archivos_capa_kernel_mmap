@@ -35,6 +35,10 @@ test: user-targets
 	@echo "===> Ejecutando Suite de Pruebas Automatizadas..."
 	./scripts/run_all_tests.sh
 
+shell: user-targets
+	@echo "===> Iniciando Shell Interactiva de Seguridad..."
+	./user/sec_mmap_demo
+
 benchmark: user-targets
 	@echo "===> Ejecutando Benchmark de Rendimiento..."
 	./scripts/run_benchmark.sh
@@ -45,5 +49,5 @@ load:
 unload:
 	./scripts/unload_module.sh
 
-.PHONY: all modules user-targets ebpf-targets clean test benchmark load unload
+.PHONY: all modules user-targets ebpf-targets clean test benchmark load unload shell
 

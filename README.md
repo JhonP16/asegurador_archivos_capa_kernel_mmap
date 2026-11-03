@@ -111,7 +111,27 @@ El `Makefile` raíz compila todos los módulos, binarios y programas eBPF sin ad
 make all
 ```
 
-### 5.2 Ejecutar la Suite de Pruebas Automatizadas
+### 5.2 Shell Interactiva de Seguridad (REPL)
+
+Puedes iniciar la consola interactiva tipo shell con banner visual y menú de comandos:
+```bash
+make shell
+# O directamente:
+./user/sec_mmap_demo
+```
+Dentro de la shell interactiva dispones de los siguientes comandos:
+* `status` : Consulta telemetría en tiempo real del kernel (`/proc/sec_mmap_status`).
+* `poc1`   : Ejecuta la prueba de evasión POSIX y control de acceso.
+* `poc2`   : Ejecuta la prueba de condición de carrera Dirty COW (50,000 iteraciones).
+* `poc3`   : Ejecuta la validación de cifrado transparente de páginas en RAM.
+* `bench`  : Ejecuta el benchmark de rendimiento comparativo.
+* `all`    : Ejecuta toda la suite de pruebas consecutivamente.
+* `set-ro` : Establece la política del Kernel en modo Solo Lectura.
+* `set-rw` : Establece la política del Kernel en modo Lectura/Escritura.
+* `clear`  : Limpia la pantalla y refresca el banner.
+* `exit`   : Sale de la shell interactiva.
+
+### 5.3 Ejecutar la Suite de Pruebas Automatizadas
 
 ```bash
 make test
