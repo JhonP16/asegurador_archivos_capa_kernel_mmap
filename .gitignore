@@ -1,0 +1,28 @@
+# Binarios y objetos de compilación de Kernel
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.order
+*.symvers
+.*.cmd
+.tmp_versions/
+/kernel/.tmp_versions/
+Module.symvers
+modules.order
+
+# Binarios de usuario y ejecutables de prueba
+user/test_unauthorized
+user/test_race_cow
+user/test_crypto_integrity
+user/benchmark_perf
+user/sec_mmap_demo
+ebpf/mmap_audit.bpf.o
+ebpf/mmap_audit_user
+
+# Logs y temporales
+*.log
+/tmp/sec_*
+.cache/
+
