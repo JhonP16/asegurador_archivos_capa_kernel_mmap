@@ -7,6 +7,11 @@
 > **Referencia Base:** [SO2026B - CapaKernel](https://github.com/evalenciEAFIT/SO2026B/tree/main/USOS/CapaKernel)
 
 ---
+## 01. Video de sustentacion:
+
+https://youtu.be/oYIvTWvzVF0
+
+---
 
 ## 1. Resumen Ejecutivo
 
