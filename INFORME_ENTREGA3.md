@@ -49,409 +49,187 @@
 ### Pregunta 1: Mapeo Virtual y Page Faults
 **Enunciado:** *¿Cuál es la secuencia exacta de eventos a nivel de kernel y MMU desde que un proceso invoca `mmap()` hasta que ocurre el primer fallo de página (Page Fault) por lectura o escritura en una página mapeada?*
 
-#### Respuesta y Fundamentación Técnica Rigurosa:
+#### Respuesta Técnica:
+El ciclo de vida opera bajo el principio de **asignación perezosa (*lazy allocation*)**:
 
-El ciclo de vida de un mapeo mediante `mmap()` y su resolución mediante la Unidad de Manejo de Memoria (**MMU**) opera bajo una filosofía estricta de **evaluación perezosa (*lazy allocation*)**. La secuencia exacta se desglosa en dos fases fundamentales:
+1. **Alta del VMA (`sys_mmap`):**
+   - El proceso invoca `mmap()`, produciendo una conmutación a Ring 0 (`sys_mmap` -> `do_mmap()`).
+   - El kernel adquiere `mmap_lock`, busca un rango virtual disponible con `get_unmapped_area()` y crea el descriptor `struct vm_area_struct` (VMA).
+   - Configura los límites (`vm_start`, `vm_end`), permisos (`vm_flags`, `vm_page_prot`) y asocia las operaciones del archivo (`vma->vm_ops = filp->f_op->mmap`).
+   - El VMA se inserta en el árbol del proceso (Maple Tree `mm_mt`).
+   - **En este punto no se asigna memoria física en RAM ni se crean entradas en la tabla de páginas (PTE).** La llamada retorna el puntero virtual `ptr` al proceso en Ring 3.
 
-```
-+--------------------------------------------------------------------------------------------------+
-| FASE 1: Alta del VMA en Espacio de Direcciones Virtuales (Syscall mmap)                           |
-+--------------------------------------------------------------------------------------------------+
-  Proceso Ring 3 (mmap) 
-       |
-       v  [Syscall Trap / Instruction SYSCALL]
-  sys_mmap() -> ksys_mmap_pgoff() -> vm_mmap_pgoff() -> do_mmap()
-       |
-       +--> 1. Adquisición de semáforo: down_write(&mm->mmap_lock)
-       +--> 2. Búsqueda de hueco virtual contiguo libre mediante get_unmapped_area()
-       +--> 3. Instanciación de struct vm_area_struct (VMA) mediante vm_area_alloc()
-       +--> 4. Inicialización de descriptores del VMA:
-       |        * vma->vm_start = Dirección virtual inicial (e.g. 0x7f2d45200000)
-       |        * vma->vm_end   = Dirección virtual final (vma->vm_start + len)
-       |        * vma->vm_flags = VM_READ | VM_SHARED | VM_MAYREAD | VM_MAYWRITE
-       |        * vma->vm_page_prot = vm_get_page_prot(vma->vm_flags)
-       |        * vma->vm_file  = struct file *filp (Incrementa f_count con get_file())
-       |        * vma->vm_ops   = filp->f_op->mmap(filp, vma)  [Asigna callbacks de memoria]
-       +--> 5. Inserción del VMA en el árbol de rangos del proceso (Maple Tree mm_mt en Linux 6.x+)
-       +--> 6. Liberación de cerrojo: up_write(&mm->mmap_lock)
-       v
-  Retorno al Proceso Ring 3 con el puntero virtual `ptr`.
-  ¡EN ESTE MOMENTO NO SE HA ASIGNADO NINGÚN MARCO FÍSICO DE RAM (PFN) NI SE HAN CREADO PTEs!
-```
+2. **Fallo de Página de Hardware (#PF, Vector 14):**
+   - El proceso intenta acceder a la memoria (ej. `MOV (%rax), %rbx`).
+   - La MMU recorre la jerarquía de tablas de páginas desde el registro `CR3` (PGD -> P4D -> PUD -> PMD -> PTE).
+   - Al llegar a la PTE, la MMU detecta que el bit **`_PAGE_PRESENT` (Bit 0) es cero**.
+   - La CPU suspende la instrucción, guarda la dirección culpable en el registro **`CR2`** y dispara la excepción de hardware **Page Fault (#PF, Vector 14)** a Ring 0.
 
-```
-+--------------------------------------------------------------------------------------------------+
-| FASE 2: Excepción de Hardware Page Fault (#PF, Vector 14) en el Primer Acceso                   |
-+--------------------------------------------------------------------------------------------------+
-  Instrucción CPU: MOV (%rax), %rbx  (donde %rax contiene la dirección virtual `ptr`)
-       |
-       v
-  La MMU toma la dirección virtual e inicia el recorrido de tablas (*Page Table Walk*):
-       * Lee el registro de control CR3 (apunta a la base física de la tabla PGD del proceso)
-       * PGD (Page Global Directory) -> P4D -> PUD -> PMD
-       * Llega a la entrada PTE (Page Table Entry).
-       * LA MMU DETECTA QUE EL BIT `_PAGE_PRESENT` (Bit 0) ES CERO (PTE vacía o ausente).
-       |
-       v  [Excepción de Hardware de CPU]
-  La CPU suspende la instrucción MOV y dispara la interrupción de hardware Page Fault (#PF, Vector 14).
-  El hardware guarda en la pila del kernel: SS, RSP, RFLAGS, CS, RIP y empuja el Código de Error (#PF Error Code).
-  La CPU almacena la dirección virtual causante en el registro de control **CR2**.
-       |
-       v  [Transición Automática a Ring 0]
-  Manejador de bajo nivel: exc_page_fault() -> do_user_addr_fault()
-       +--> 1. Lee CR2 y adquiere cerrojo: down_read(&mm->mmap_lock) (o vma_start_read(vma) en 6.x)
-       +--> 2. Busca el VMA correspondiente en el Maple Tree: find_vma(mm, address)
-       +--> 3. Comprueba permisos: ¿address >= vma->vm_start && (vma->vm_flags & VM_READ)?
-       +--> 4. Invoca el subsistema de paginación central:
-                handle_mm_fault(vma, address, flags, regs)
-                  -> __handle_mm_fault() -> handle_pte_fault()
-       +--> 5. Si la entrada no existe y es mapeo con respaldo en archivo:
-                do_fault() -> do_read_fault()
-                  -> vma->vm_ops->fault(struct vm_fault *vmf)
-       +--> 6. Callback de archivo (filemap_fault()):
-                * Consulta el Page Cache (address_space->i_pages / XArray).
-                * Si la página no está en RAM: emite solicitud de E/S por bloques (bio/request) al disco.
-                * Al completarse la lectura, asigna el descriptor físico `struct page`.
-       +--> 7. Asignación de PTE (set_pte_at()):
-                * Escribe la dirección física base (PFN) en la PTE.
-                * Activa bits de hardware: `_PAGE_PRESENT=1`, `_PAGE_USER=1`, `_PAGE_ACCESSED=1`.
-                * Si es solo lectura: `_PAGE_RW=0`.
-       +--> 8. Liberación de cerraduras y retorno de interrupción con `IRETQ`.
-       v
-  La CPU reanuda exactamente la misma instrucción `MOV (%rax), %rbx`.
-  Ahora la MMU encuentra la PTE presente en el TLB/RAM y la lectura concluye a velocidad de hardware.
-```
+3. **Resolución en el Kernel:**
+   - El manejador central `handle_mm_fault()` localiza el VMA y llama a `vma->vm_ops->fault()` (o `filemap_fault()`).
+   - El subsistema de archivos ubica la página en el Page Cache (`address_space`) o emite una solicitud de E/S por bloques al disco para cargarla en un marco físico (`struct page`).
+   - El kernel escribe la entrada en la PTE con `set_pte_at()`, asignando el Page Frame Number (PFN) y activando `_PAGE_PRESENT = 1`, `_PAGE_USER = 1` y los bits de permiso correspondientes.
+   - La CPU invalida el TLB, retorna mediante `IRETQ` y reanuda la instrucción original, que ahora se completa a velocidad directa de hardware.
 
 ---
 
 ### Pregunta 2: MAP_SHARED vs. MAP_PRIVATE
 **Enunciado:** *¿Cómo gestiona el subsistema de memoria virtual de Linux (`struct vm_area_struct`) la diferencia entre banderas `MAP_SHARED` y `MAP_PRIVATE`, y cuáles son las implicaciones de seguridad respecto a la persistencia y visibilidad cruzada entre procesos?*
 
-#### Respuesta y Fundamentación Técnica Rigurosa:
+#### Respuesta Técnica:
+La gestión se define internamente en los campos `vma->vm_flags` y en las entradas PTE de la MMU:
 
-En el kernel de Linux, las banderas POSIX `MAP_SHARED` y `MAP_PRIVATE` se traducen internamente en los campos `vma->vm_flags` y en la configuración de permisos de hardware `vma->vm_page_prot`.
+| Característica | `MAP_SHARED` | `MAP_PRIVATE` |
+| :--- | :--- | :--- |
+| **Banderas VMA** | Contiene `VM_SHARED` y `VM_MAYSHARE`. | No contiene `VM_SHARED`; contiene `VM_MAYWRITE`. |
+| **PTE Inicial** | Apunta al marco físico del Page Cache del inodo. | Apunta al Page Cache, pero con bit `_PAGE_RW = 0` (Solo Lectura). |
+| **Escritura** | Escribe directamente en la página física compartida. | Dispara Copy-On-Write (COW): duplica en una página anónima privada. |
+| **Persistencia** | Sí. Se marca sucia (`PageDirty`) y se vuelca al disco. | No. Las modificaciones se descartan al cerrar el proceso. |
+| **Visibilidad** | Cruzada inmediata: visible para todos los procesos. | Aislada exclusivamente al espacio virtual del proceso local. |
 
-```
-                    +------------------------------------------------+
-                    |            DIFERENCIACIÓN EN EL KERNEL         |
-+-------------------+--------------------------------+---------------+--------------------------------+
-| Característica    | MAP_SHARED                     | MAP_PRIVATE                                    |
-+-------------------+--------------------------------+---------------+--------------------------------+
-| Banderas VMA      | VM_SHARED | VM_MAYSHARE        | !(VM_SHARED), VM_MAYWRITE                      |
-| PTE Inicial       | Apunta al Page Cache (R/W)     | Apunta al Page Cache (Solo Lectura, R/O)       |
-| Destino Escritura | Page Cache global del inodo    | Marco anónimo privado (Copia en RAM)           |
-| Persistencia      | Sí (volcado a disco vía msync) | No (se descarta al terminar el proceso)        |
-| Visibilidad       | Cruzada entre todos los procesos| Aislada al espacio virtual local               |
-+-------------------+--------------------------------+------------------------------------------------+
-```
-
-1. **Gestión Interna en `struct vm_area_struct`:**
-   - **`MAP_SHARED`:** `vma->vm_flags` contiene la bandera `VM_SHARED`. Cuando la entrada de la tabla de páginas se escribe mediante `alloc_set_pte()`, la PTE apunta directamente a la página física almacenada en el Page Cache del archivo (`vma->vm_file->f_mapping->i_pages`). Cualquier otro proceso que abra el mismo archivo con `MAP_SHARED` tendrá entradas PTE que apuntan **al mismo Page Frame Number (PFN)** en la memoria física.
-   - **`MAP_PRIVATE`:** El kernel activa `VM_MAYWRITE` (si se pidió `PROT_WRITE`), pero desactiva `VM_SHARED`. La PTE inicial se mapea con el bit de hardware `_PAGE_RW = 0` (solo lectura), apuntando temporalmente a la página del Page Cache. Cuando el proceso intenta escribir, la MMU dispara una excepción `#PF` por violación de permisos de escritura, invocando `do_wp_page()` para desencadenar el mecanismo Copy-On-Write (COW).
-
-2. **Implicaciones Críticas de Seguridad:**
-   - **Visibilidad Cruzada:** En `MAP_SHARED`, si un proceso no privilegiado escribe en la memoria mapeada, la modificación es visible de inmediato para todos los demás procesos en el sistema, incluidos demonios del sistema ejecutándose como `root`. Esto crea un vector de ataque directo si un proceso malicioso altera búferes de comunicación o estructuras compartidas.
-   - **Persistencia No Autorizada:** Las escrituras en `MAP_SHARED` marcan la página como sucia (`PageDirty`) en el Page Cache. Tarde o temprano, los hilos de kernel `kworker/kswapd` vaciarán (`writeback`) esos bytes al almacenamiento persistente, corrompiendo el archivo original en disco.
-   - **Aislamiento en `MAP_PRIVATE`:** `MAP_PRIVATE` previene la corrupción persistente, pues las modificaciones se aíslan en páginas anónimas. Sin embargo, si el kernel falla en la gestión de banderas de protección, un atacante puede inducir al kernel a omitir la duplicación privada y escribir sobre la página original del Page Cache (raíz del ataque Dirty COW).
+**Implicaciones de Seguridad:**
+- **`MAP_SHARED`:** Cualquier modificación no autorizada es inmediatamente visible por otros procesos (incluyendo demonios con privilegios de `root`) y corrompe el archivo base en disco tras el vaciado (*writeback*).
+- **`MAP_PRIVATE`:** Garantiza aislamiento de modificaciones. Sin embargo, si el kernel falla en la sincronización de banderas COW, un atacante puede engañar al subsistema de memoria para escribir sobre la página original del Page Cache (vulnerabilidad Dirty COW).
 
 ---
 
 ### Pregunta 3: Mecanismo Copy-On-Write (COW) y Vulnerabilidad Dirty COW
 **Enunciado:** *Describa el ciclo de vida de una página bajo COW. ¿En qué condiciones una falla en la gestión de banderas de protección (`VM_MAYWRITE`, `PROT_READ`, `PROT_WRITE`) en el kernel puede derivar en una escalada de privilegios o corrupción de archivos del sistema?*
 
-#### Respuesta y Fundamentación Técnica Rigurosa:
+#### Respuesta Técnica:
 
-#### 1. Ciclo de Vida de una Página bajo Copy-On-Write (COW):
-1. **Asignación Inicial:** Dos o más procesos (o un proceso con `MAP_PRIVATE`) comparten el mismo marco de página físico de solo lectura (`struct page` en Page Cache). Sus entradas PTE tienen `_PAGE_PRESENT=1`, `_PAGE_RW=0`.
-2. **Intento de Escritura:** Un proceso ejecuta `MOV %rbx, (%rax)`. La MMU comprueba los bits de la PTE; al notar `_PAGE_RW=0` para una operación de escritura, suspende la ejecución y dispara un fallo de página `#PF` con código de error indicando violación de escritura (`FAULT_FLAG_WRITE`).
-3. **Atención en Kernel (`do_wp_page()`):**
-   - El kernel verifica si la página es exclusiva (`page_count(page) == 1`). Si nadie más la comparte, simplemente activa `_PAGE_RW=1` mediante `reuse_swap_page()`.
-   - Si la página es compartida (`page_count(page) > 1`):
-     a) Asigna un nuevo marco físico anónimo con `alloc_zeroed_user_highpage_movable(vma, address)`.
-     b) Copia byte a byte el contenido de la página original a la nueva página mediante `copy_user_highpage()`.
-     c) Decrementa el contador de referencias de la página original (`put_page(old_page)`).
-     d) Modifica la PTE del proceso escritor para apuntar al **nuevo PFN**, configurando `_PAGE_RW=1`.
-     e) Invalida la entrada correspondiente en el TLB del procesador (`flush_tlb_page()`).
-4. **Reanudación:** La instrucción de escritura se reinicia, escribiendo de forma totalmente aislada en la copia privada.
+1. **Ciclo de Vida Copy-On-Write:**
+   - **Compartición Inicial:** Dos o más procesos mapean la misma página física en modo lectura (`_PAGE_PRESENT = 1`, `_PAGE_RW = 0`).
+   - **Intento de Escritura:** Un proceso intenta escribir. La MMU detecta `_PAGE_RW = 0` y genera un fallo de página con código de escritura (`FAULT_FLAG_WRITE`).
+   - **Duplicación (`do_wp_page`):** El kernel verifica que el VMA permita escritura (`VM_MAYWRITE`). Asigna un nuevo marco de página físico (`alloc_page()`), copia el contenido original con `copy_user_highpage()` y enlaza la PTE del proceso hacia el nuevo marco privado con `_PAGE_RW = 1`.
+   - **Aislamiento:** La instrucción se reinicia y escribe sobre la copia privada sin afectar a los demás procesos ni al archivo base.
 
-```mermaid
-sequenceDiagram
-    participant CPU as CPU / MMU
-    participant Kernel as Kernel (do_wp_page)
-    participant PageCache as Page Cache (Lectura)
-    participant PrivatePage as Nueva Página RAM (COW)
-
-    CPU->>PageCache: Intento MOV (Escritura en PTE con R/W=0)
-    PageCache-->>CPU: Excepción #PF (Vector 14)
-    CPU->>Kernel: exc_page_fault(address, FAULT_FLAG_WRITE)
-    Kernel->>Kernel: Comprueba VMA (VM_MAYWRITE activo)
-    Kernel->>PrivatePage: Asigna nuevo marco físico alloc_page()
-    Kernel->>PrivatePage: Copia bytes desde Page Cache (memcpy)
-    Kernel->>CPU: Actualiza PTE -> Nuevo PFN con R/W=1
-    Kernel->>CPU: Invalida TLB (flush_tlb_page)
-    Kernel->>CPU: Retorna a Ring 3 (IRETQ)
-    CPU->>PrivatePage: Re-ejecuta MOV exitosamente en copia local
-```
-
-#### 2. Condiciones de Falla y Escalada de Privilegios (Caso Dirty COW / CVE-2016-5195):
-La vulnerabilidad histórica **Dirty COW** demostró la fragilidad de este mecanismo ante condiciones de carrera en el manejo de banderas de protección dentro de `mm/gup.c` (`__get_user_pages()`):
-- **Escenario:** Un atacante abre un archivo propiedad de `root` sin permisos de escritura (e.g. `/etc/passwd`) con `O_RDONLY`, y lo mapea con `mmap(..., PROT_READ, MAP_PRIVATE, fd, 0)`.
-- **Inyección mediante `/proc/self/mem`:** El atacante invoca `write()` sobre `/proc/self/mem` apuntando a la dirección mapeada. El kernel utiliza `get_user_pages()` con las banderas `FOLL_FORCE | FOLL_WRITE`.
-- **La Carrera Crítica:**
-  1. `get_user_pages()` detecta que la página no tiene permisos de escritura y fuerza la rotura del COW (`faultin_page(..., FOLL_WRITE)`), creando la copia privada.
-  2. En ese instante exacto, un segundo hilo atacante invoca `madvise(addr, len, MADV_DONTNEED)`. Esta llamada limpia la entrada PTE de la tabla de páginas y descarta la página privada recién creada.
-  3. En la siguiente iteración de reintento de `get_user_pages()`, el kernel comprueba la PTE y la encuentra vacía. Vuelve a llamar a `handle_mm_fault()`, pero debido a un bug de estado en la gestión de banderas de reintento, el kernel asumió que el paso COW ya había tenido éxito y **removió la bandera `FOLL_WRITE`**.
-  4. Como resultado, el kernel resolvió la página directamente contra el **Page Cache original de solo lectura**, y `write()` escribió los datos directamente sobre la caché física del archivo `/etc/passwd`.
-  5. Los hilos `writeback` persistieron la alteración a disco, permitiendo al atacante sobrescribir el archivo de contraseñas y obtener acceso de superusuario (`root`).
-- **Mitigación en Kernels Modernos:** El kernel introdujo la bandera interna `FOLL_COW` para garantizar que ninguna escritura a través de GUP pueda dirigirse a una página sin verificar explícitamente que la página resultante sea una copia anónima exclusiva.
+2. **Vulnerabilidad Dirty COW (CVE-2016-5195):**
+   - Un atacante mapea un archivo de root de solo lectura (ej. `/etc/passwd`) con `MAP_PRIVATE` y `PROT_READ`.
+   - Utiliza `write()` sobre `/proc/self/mem` para forzar la escritura mediante `get_user_pages(FOLL_FORCE | FOLL_WRITE)`.
+   - **Condición de Carrera:** Mientras el kernel rompe el COW y crea la copia privada, un segundo hilo invoca concurrentemente `madvise(MADV_DONTNEED)`, descartando la página privada recién creada.
+   - En el reintento, el kernel encontró la PTE vacía, pero un fallo en la máquina de estados removió la bandera `FOLL_WRITE`. Como consecuencia, el kernel resolvió el fallo directamente contra el marco original del Page Cache de solo lectura, permitiendo al atacante sobrescribir `/etc/passwd`.
+   - **Mitigación:** Kernels modernos utilizan la bandera estricta `FOLL_COW` y verifican `PageAnonExclusive` antes de autorizar escrituras en memoria privada.
 
 ---
 
 ### Pregunta 4: Intercepción de Llamadas en Kernel: LKM vs. LSM
 **Enunciado:** *Para monitorear o restringir el uso de `mmap()` sobre archivos sensibles, ¿cuáles son las ventajas, desventajas y viabilidad de utilizar un módulo de kernel (LKM) con hook en la System Call Table frente a un Linux Security Module (LSM) con ganchos (hooks) como `file_mmap`?*
 
-#### Respuesta y Fundamentación Técnica Rigurosa:
+#### Respuesta Técnica:
 
-```
-+----------------------------------------------------------------------------------------------------+
-|                         TABLA COMPARATIVA: HOOK EN SYSCALL TABLE vs. LSM HOOKS                     |
-+--------------------------+------------------------------------+------------------------------------+
-| Dimensión                | LKM (Hook en System Call Table)    | LSM (Linux Security Module Hooks)  |
-+--------------------------+------------------------------------+------------------------------------+
-| Arquitectura             | Modificación directa de punteros en| Puntos de enganche oficiales       |
-|                          | la tabla `sys_call_table`.         | estructurados (`security_hook_heads`).|
-| Seguridad y Estabilidad  | Muy deficiente; riesgo de Kernel   | Excelente; aislamiento garantizado |
-|                          | Panic y condiciones de carrera.   | sin corrupción de memoria.         |
-| Viabilidad en Kernels 5.x| Prácticamente INVÍABLE en kernels  | TOTALMENTE VIABLE y estándar de    |
-| y 6.x contemporáneos     | modernos de producción.            | la industria.                      |
-| Parámetros Disponibles   | Argumentos crudos de la syscall    | Objetos semánticos del kernel      |
-|                          | (direcciones de memoria, enteros). | (`struct file`, `struct cred`, etc)|
-| Interacción con Protec-  | Bloqueado por `CR0.WP`, KPTI,      | Nativo; no altera código ejecutable|
-| ciones del Hardware      | W^X en Ring 0 y Page Table RoData. | del kernel.                        |
-+--------------------------+------------------------------------+------------------------------------+
-```
+- **Hook en la `sys_call_table` (Vía LKM):**
+  - *Ventajas:* Conceptualmente simple; intercepta los argumentos crudos de la llamada.
+  - *Desventajas e Inviabilidad:* 
+    - Desde Linux 2.6 la tabla no está exportada, y en Linux 5.7+ se des-exportó `kallsyms_lookup_name()`.
+    - La tabla reside en memoria de solo lectura; modificarla exige desactivar protecciones del procesador (`CR0.WP = 0`), lo cual es inestable en SMP y detectado por *Kernel Lockdown* y *CFI*.
+    - No dispone de contexto semántico de seguridad (`struct file`, credenciales del inodo). **Es una técnica obsoleta e inviable en producción.**
 
-#### Análisis Detallado de Mecanismos:
-
-1. **LKM con Hook en `sys_call_table`:**
-   - *Mecanismo:* Sobrescribir la dirección `sys_call_table[__NR_mmap]` con la dirección de una función envoltorio propia (`sec_sys_mmap`).
-   - *Inviabilidad en Kernels Contemporáneos:*
-     a) Desde Linux 2.6+, la tabla `sys_call_table` **no está exportada** (`EXPORT_SYMBOL`). Su dirección debe buscarse por heurísticas o `/proc/kallsyms`.
-     b) En Linux 5.7+, la función `kallsyms_lookup_name()` fue des-exportada para prevenir rootkits.
-     c) La memoria de la tabla reside en páginas marcadas como de solo lectura a nivel de tablas de páginas (`CR0.WP = 1` y bit R/W=0 en la PTE). Modificar `CR0` requiere desactivar protecciones de procesador con `write_cr0()`, lo cual rompe protecciones de concurrencia en CPUs multinúcleo SMP y es detectado inmediatamente por subsistemas como *Kernel Lockdown* y *Control Flow Integrity* (CFI).
-     d) No tiene acceso semántico al inodo ni a los credenciales de seguridad antes de que se creen los objetos de kernel.
-
-2. **Linux Security Module (LSM) con Gancho `file_mmap`:**
-   - *Mecanismo:* Instrumentar el hook oficial `security_mmap_file(struct file *file, unsigned long reqprot, unsigned long prot, unsigned long flags)`.
-   - *Ventajas Superiores:*
-     a) Se ejecuta dentro del flujo natural de `do_mmap()`, **antes** de que se cree el VMA o se asigne memoria virtual.
-     b) Recibe punteros tipados y resueltos: `struct file *file` permite inspeccionar directamente `file->f_inode`, la ruta canónica con `dentry_path()`, los credenciales con `current_cred()`, y las etiquetas de seguridad SELinux/AppArmor.
-     c) Con la llegada de **BPF-LSM** en Linux 5.7+ (`CONFIG_BPF_LSM`), es posible registrar ganchos LSM dinámicamente mediante programas eBPF (`SEC("lsm/file_mmap")`) firmados criptográficamente, sin necesidad de compilar un módulo LKM ni reiniciar el sistema.
+- **Ganchos LSM (Linux Security Modules) como `file_mmap`:**
+  - *Ventajas:* Puntos de control oficiales integrados en el flujo de `do_mmap()`. Recibe objetos de kernel tipados (`struct file`, `struct cred`).
+  - *Viabilidad:* Excelente. Con la llegada de **BPF-LSM** (`CONFIG_BPF_LSM`), es posible registrar políticas LSM dinámicas mediante programas eBPF firmados sin recompilar el núcleo. **Es el estándar arquitectónico recomendado.**
 
 ---
 
 ### Pregunta 5: Cifrado Transparente en Memoria RAM y Page Cache
 **Enunciado:** *Si un archivo confidencial se encuentra cifrado en disco, ¿cómo debe interactuar la capa de Page Cache y el driver de sistema de archivos en el kernel para que la proyección en `mmap()` sea legible en el espacio de usuario autorizado sin exponer el contenido descifrado a otros procesos no privilegiados en memoria física?*
 
-#### Respuesta y Fundamentación Técnica Rigurosa:
+#### Respuesta Técnica:
 
-El desafío fundamental del cifrado en archivos mapeados radica en la **naturaleza compartida del Page Cache**: si el Page Cache almacena las páginas descifradas (texto plano), cualquier proceso que logre mapear el archivo o inspeccionar la memoria física (vía `/dev/mem` o ataques de canal lateral) accederá a los datos sensibles.
+El problema de seguridad radica en que el **Page Cache es compartido a nivel de inodo**: si almacena texto descifrado, cualquier proceso local podría inspeccionarlo en RAM física.
 
-```mermaid
-flowchart TD
-    subgraph Disco ["Almacenamiento Persistente"]
-        A[Bloques Cifrados en Disco / Backing Store]
-    end
-
-    subgraph Kernel_PageCache ["Capa de Kernel (Aislamiento Criptográfico)"]
-        A -->|Lectura BIO| B["Page Cache Global (Almacena SIEMPRE Texto Cifrado)"]
-        B --> C{"Controlador de Fallo (.fault)"}
-        C -->|Proceso NO Autorizado| D[Retorna VM_FAULT_SIGBUS / -EACCES]
-        C -->|Proceso Autorizado| E["Kernel Crypto API (crypto_sync_skcipher)"]
-        E -->|Descifrado On-Demand| F["Marco de Página Físico Privado (struct page exclusiva)"]
-    end
-
-    subgraph Espacio_Usuario ["Espacio de Direcciones del Proceso"]
-        F --> G["PTE Privada: Present=1, R/W, NX"]
-        G --> H["Proceso Legítimo: Acceso a Texto Plano en RAM"]
-    end
-```
-
-#### Arquitectura de Interacción en el Kernel:
-
-1. **Almacenamiento en Page Cache Cifrado (Modelo `fscrypt` / `dm-crypt` adaptado):**
-   - El Page Cache asociado al `struct address_space` del archivo almacena **únicamente bloques cifrados** tal como residen en el disco.
-   - Si un proceso no privilegiado abre el archivo y realiza `read()` o `mmap()`, el kernel le entrega únicamente bloques ilegibles de texto cifrado (*ciphertext*).
-
-2. **Intercepción en el Fallo de Página por Demanda (`vm_operations_struct->fault`):**
-   - Cuando el proceso autorizado accede a su dirección virtual, se dispara el fallo de página `#PF`.
-   - El manejador `.fault` del controlador:
-     a) Autentica el proceso: verifica su token de sesión, credenciales (`current_cred()->uid`) o llave en el *Kernel Keyring* (`struct key`).
-     b) Si la autenticación es exitosa, en lugar de compartir la página física del Page Cache global, el driver asigna un marco de página física **independiente y privado** mediante `alloc_page(GFP_KERNEL | __GFP_ZERO)`.
-     c) Invoca la API criptográfica del kernel (`crypto_sync_skcipher_decrypt` con AES-256-XTS o ChaCha20) para descifrar el bloque del Page Cache hacia el marco de página privado recién asignado.
-     d) Asigna este marco físico privado a la entrada PTE del proceso autorizado con `set_pte_at()`.
-
-3. **Prevención de Exposición Cruzada y Sanitización:**
-   - La página en texto plano tiene su bandera `SetPageReserved()` o se etiqueta como anónima exclusiva, impidiendo que el subsistema de memoria la fusione con otros procesos mediante KSM (*Kernel Samepage Merging*).
-   - En el callback de cierre del VMA (`vm_operations_struct->close`) o al terminar el proceso, el kernel ejecuta `memzero_explicit()` sobre el marco de página físico antes de liberarlo (`__free_page()`), neutralizando ataques de reutilización de memoria (*use-after-free* o volcados residuales en RAM).
+**Solución Arquitectónica en el Kernel:**
+1. **Page Cache Cifrado:** El Page Cache asociado al archivo almacena exclusivamente bloques cifrados (*ciphertext*), tal como residen en disco.
+2. **Descifrado por Demanda en `.fault`:** Cuando un proceso accede a su memoria virtual, se dispara el fallo de página. El callback `vma->vm_ops->fault`:
+   - Autentica las credenciales del solicitante (`current_uid()` o llaves en el *Kernel Keyring*).
+   - Asigna un **marco de página físico privado y exclusivo** (`alloc_page()`).
+   - Descifra el bloque del Page Cache hacia ese marco privado mediante la API criptográfica del kernel (`crypto_sync_skcipher`).
+   - Asocia la PTE del proceso a su marco privado descifrado.
+3. **Aislamiento y Sanitización:** La página se marca como reservada para impedir que subsistemas como KSM la compartan. Al desmapear (`munmap`) o terminar el proceso, el callback `close` ejecuta `memzero_explicit()` para purgar los datos confidenciales de la RAM física.
 
 ---
 
 ### Pregunta 6: Sincronización e Integridad (`msync` y `fsync`)
 **Enunciado:** *¿Cómo garantiza el kernel la consistencia de páginas marcadas como sucias (dirty pages) en memoria antes de ser persistidas en disco, y cómo puede un atacante evadir filtros de seguridad si los datos no son inspeccionados en el momento de la escritura en memoria?*
 
-#### Respuesta y Fundamentación Técnica Rigurosa:
+#### Respuesta Técnica:
 
-#### 1. Gestión de Páginas Sucias en el Kernel:
-1. **Detección por Hardware:** Cuando la CPU escribe en una página mapeada con `MAP_SHARED`, la MMU activa automáticamente el bit 6 (`_PAGE_DIRTY`) en la entrada PTE correspondiente a nivel de silicio, sin conmutar a Ring 0.
-2. **Ciclo de Persistencia:**
-   - Cuando el proceso invoca `msync(addr, len, MS_SYNC)`:
-     a) El kernel recorre las PTEs del rango virtual con `walk_page_range()`.
-     b) Si encuentra el bit `_PAGE_DIRTY`, transfiere el estado al descriptor físico `struct page` invocando `set_page_dirty()` y marca el inodo como sucio en el Radix Tree / XArray del `struct address_space`.
-     c) Invoca la función `f_op->fsync()` del sistema de archivos, la cual construye peticiones de bloques (`bio`) y vacía los búferes al disco mediante comandos de sincronización de hardware (*flush cache barriers*).
-   - En segundo plano, si el proceso no llama a `msync()`, los hilos del kernel `pdflush`/`kworker flusher` recorren periódicamente las páginas sucias según los umbrales de `/proc/sys/vm/dirty_background_ratio`.
+1. **Gestión de Páginas Sucias:**
+   - Cuando un proceso escribe en una página mapeada compartida, la MMU activa automáticamente el bit `_PAGE_DIRTY` (Bit 6) en la PTE por hardware.
+   - Cuando se invoca `msync()` o actúan los hilos del kernel (`writeback`/`kswapd`), el kernel escanea las PTEs, transfiere el estado al inodo con `SetPageDirty()` y programa la escritura en disco mediante `fsync()`.
 
-```
-Escritura mmap() (Ring 3) ──> MMU activa Bit _PAGE_DIRTY (Sin Syscall) ──> RAM Física Sucia
-                                                                                  │
-  [PUNTO CIEGO: Ningún filtro VFS/LSM ve esta modificación]                       │
-                                                                                  ▼
-msync() / Flush Automático ──> Kernel busca páginas sucias ──> writeback a Disco
-```
-
-#### 2. Vector de Evasión de Filtros de Seguridad y Ceguera de la E/S:
-- **El Punto Ciego de `mmap()`:** En la E/S tradicional (`write()`), cada operación pasa obligatoriamente por el punto de intercepción VFS en Ring 0 (`vfs_write()`), permitiendo que módulos de seguridad (LSM), firewalls de archivos, analizadores antimalware o auditores de integridad inspeccionen los datos en tiempo real.
-- **La Evasión:** En `mmap()`, una vez otorgado el mapeo con `PROT_WRITE`, **millones de escrituras se ejecutan mediante instrucciones `MOV` a velocidad de bus de memoria sin generar una sola llamada al sistema**.
-- Si un atacante inyecta una carga maliciosa (e.g. modifica un ejecutable compartido, corrompe una base de datos o inserta una clave pública no autorizada), los monitores basados en syscalls (`strace`, auditd tradicional o interceptores de `sys_write`) permanecen completamente ciegos.
-- Cuando finalmente se ejecuta `msync()` o el proceso termina, el kernel persiste los datos adulterados sin haber realizado ninguna inspección de contenido.
-- **Contención en Kernel:** La defensa exige implementar el gancho `->page_mkwrite` en el VMA. Al forzar que las páginas se mapeen inicialmente como de solo lectura, la primera escritura dispara una trampa al kernel en Ring 0, permitiendo registrar la intención de modificación, validar permisos y computar hashes de integridad antes de autorizar la escritura.
+2. **Vector de Evasión y Ceguera de Seguridad:**
+   - En la E/S tradicional (`write()`), cada operación pasa por el VFS en Ring 0 (`vfs_write()`), donde los antivirus y módulos LSM inspeccionan los datos.
+   - En `mmap()`, una vez la PTE tiene `_PAGE_RW = 1`, **todas las escrituras ocurren directamente en memoria RAM a velocidad de CPU sin generar ninguna llamada al sistema**.
+   - Los monitores de syscalls (`strace`, auditd tradicional) permanecen ciegos durante la alteración. Los datos maliciosos se persisten al disco en segundo plano sin inspección.
+   - **Mitigación en Kernel:** Utilizar el callback `vma->vm_ops->page_mkwrite`. Al mantener inicialmente las páginas compartidas como de solo lectura, la primera escritura dispara un fallo al kernel, permitiendo validar permisos e integridad antes de autorizar la modificación.
 
 ---
 
 ### Pregunta 7: Control de Accesos y Auditoría con eBPF
 **Enunciado:** *¿Cómo se puede emplear eBPF (Extended Berkeley Packet Filter) y `kprobes`/`fexit` para auditar accesos indebidos o patrones anómalos de lectura/escritura sobre regiones mapeadas con `mmap()` sin recompilar el núcleo del sistema operativo?*
 
-#### Respuesta y Fundamentación Técnica Rigurosa:
+#### Respuesta Técnica:
 
-**eBPF** permite ejecutar código de inspección de seguridad en Ring 0 con garantías formales de terminación y seguridad de memoria gracias al **Verificador BPF del Kernel**.
+eBPF permite ejecutar código de seguridad seguro y verificado en Ring 0 sin recompilar el kernel:
 
-#### Arquitectura de Auditoría eBPF:
-1. **Instrumentación de Puntos Estratégicos:**
-   - **`tracepoint/syscalls/sys_enter_mmap`:** Captura instantáneamente cada solicitud `mmap()` proveniente de cualquier proceso. Extrae: PID, UID, flags (`MAP_SHARED` vs `MAP_PRIVATE`), protección solicitada (`PROT_READ | PROT_WRITE | PROT_EXEC`) y descriptor de archivo (`fd`).
-   - **`kprobe/vma_link` o `kprobe/handle_mm_fault`:** Permite observar el momento exacto en que una dirección virtual dispara un fallo de página, registrando el desplazamiento exacto del archivo que se está cargando a memoria.
-   - **`fexit/sys_mmap`:** Inspecciona la dirección virtual de retorno asignada por el kernel, validando si el rango asignado coincide con zonas de memoria anómalas.
-
-2. **Detección de Patrones Anómalos en Tiempo Real:**
-   - **W^X Violations (Write XOR Execute):** Un programa eBPF puede inspeccionar `prot & (PROT_WRITE | PROT_EXEC)`. Si un proceso solicita páginas con permisos de escritura y ejecución simultáneos, eBPF detecta inmediatamente un patrón clásico de inyección de código / *shellcode*.
-   - **Mapeos Anómalos sobre Archivos de Sistema:** Comparando el puntero del inodo con una tabla hash BPF (`BPF_MAP_TYPE_HASH`) que almacene los inodos de archivos críticos (`/etc/shadow`, `/usr/bin/sudo`), el programa eBPF genera una alerta de intrusión inmediata si un UID no autorizado mapea dichos archivos.
-
-3. **Comunicación de Ultra-Baja Latencia con Espacio de Usuario:**
-   - Los eventos se empaquetan en una estructura binaria compacta (`struct mmap_event`) y se envían a espacio de usuario mediante un **BPF Ring Buffer** (`BPF_MAP_TYPE_RINGBUF`).
-   - A diferencia de los búferes de eventos tradicionales (perf-buffers), el Ring Buffer de eBPF soporta memoria compartida sin copiado adicional (*lockless zero-copy memory*), permitiendo a demonios de seguridad procesar cientos de miles de eventos por segundo con menos del 1% de sobrecosto de CPU.
+1. **Instrumentación No Invasiva:**
+   - **Tracepoints (`sys_enter_mmap`):** Capturan cada llamada a `mmap()`, extrayendo PID, UID, archivo, flags (`MAP_SHARED/PRIVATE`) y permisos (`PROT_READ/WRITE/EXEC`).
+   - **Kprobes / Fexit (`handle_mm_fault`):** Monitorean qué direcciones y desplazamientos de archivo disparan fallos de página reales en la MMU.
+2. **Detección de Anomalías:**
+   - Detecta de inmediato solicitudes que violen el principio **W^X** (`PROT_WRITE | PROT_EXEC`), patrón típico de inyecciones de *shellcode*.
+   - Compara los inodos mapeados contra mapas hash BPF para generar alertas si procesos no autorizados intentan mapear archivos críticos del sistema.
+3. **Auditoría de Ultra-Baja Latencia:** Los eventos se envían a espacio de usuario a través de un **BPF Ring Buffer** (`BPF_MAP_TYPE_RINGBUF`), proporcionando telemetría en tiempo real sin copiado redundante y con un sobrecosto menor al 1% de CPU.
 
 ---
 
 ### Pregunta 8: Evasión de Permisos POSIX con Mapeos Privados
 **Enunciado:** *Si un proceso abre un descriptor de archivo con permisos de solo lectura (`O_RDONLY`), ¿puede bajo ciertas configuraciones de kernel mapearlo con `PROT_READ | PROT_WRITE` y `MAP_PRIVATE`? Explique por qué el kernel lo permite y qué riesgos de fuga de información o alteración temporal de datos implica.*
 
-#### Respuesta y Fundamentación Técnica Rigurosa:
+#### Respuesta Técnica:
 
-#### 1. ¿Por qué el Kernel lo Permite? (Fundamento del Estándar POSIX):
-**Sí, el kernel de Linux lo permite explícitamente**, y este comportamiento cumple rigurosamente con el estándar POSIX (`IEEE Std 1003.1`):
-- Cuando un proceso invoca `open(path, O_RDONLY)`, el VFS verifica que el proceso tenga permisos de lectura (`MAY_READ`) sobre el inodo.
-- Posteriormente, al invocar `mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0)`:
-  - El kernel en `do_mmap()` evalúa:
-    ```c
-    if ((flags & MAP_SHARED) && (prot & PROT_WRITE) && !(file->f_mode & FMODE_WRITE))
-        return -EACCES; /* BLOQUEADO: No se puede escribir en archivo abierto O_RDONLY en modo compartido */
-    ```
-  - Sin embargo, para `MAP_PRIVATE`:
-    ```c
-    /* En MAP_PRIVATE, las escrituras NUNCA modifican el archivo subyacente.
-     * Solo se requiere que el archivo sea legible para poblar la copia privada */
-    if (!(file->f_mode & FMODE_READ))
-        return -EACCES;
-    ```
-- **Razón Arquitectónica:** En un mapeo privado con Copy-On-Write, el archivo en disco actúa únicamente como una **plantilla de inicialización de datos en RAM**. Cualquier escritura futura creará páginas anónimas exclusivas del proceso. Por ende, el kernel considera que el proceso no está modificando el archivo del sistema, sino su propia memoria virtual privada.
+1. **Por qué el Kernel lo Permite (Estándar POSIX):**
+   - Si se solicita `MAP_SHARED` con `PROT_WRITE` sobre un descriptor `O_RDONLY`, el kernel lo rechaza con `-EACCES`.
+   - Sin embargo, **con `MAP_PRIVATE` sí lo permite**. La razón es que el estándar POSIX establece que las escrituras en un mapeo privado nunca alteran el archivo original, sino una copia privada en RAM (Copy-On-Write). El descriptor solo requiere permisos de lectura (`FMODE_READ`) para inicializar la memoria.
 
-#### 2. Riesgos de Seguridad y Fuga de Información:
-1. **Fuga de Información Confidencial (Information Leakage):** Procesos no privilegiados que tengan acceso de lectura a archivos sensibles (e.g. configuraciones compartidas, binarios o diccionarios) pueden proyectar el contenido en regiones modificables de su memoria y manipular los datos en RAM para sortear chequeos de integridad internos en espacio de usuario.
-2. **Evasión de Controles de Seguridad a Nivel de Aplicación:** Muchas aplicaciones asumen que si abrieron un archivo con `O_RDONLY`, los datos en memoria permanecerán inmutables. Un atacante que controle el hilo o que inyecte código en la aplicación puede modificar punteros sobre el VMA privado, alterando tablas de salto, credenciales en caché o listas de control de acceso en memoria sin tocar el disco.
-3. **Plataforma de Lanzamiento para Ataques de Concurrencia:** Este mecanismo es el requisito previo indispensable para explotar fallas de carrera en el kernel (como Dirty COW), ya que provee al atacante una región virtual respaldada por un archivo de sistema pero con la bandera `VM_MAYWRITE` activa en el descriptor del VMA.
+2. **Riesgos de Seguridad:**
+   - **Fuga y alteración de datos en memoria:** Procesos no privilegiados pueden cargar archivos protegidos en memoria modificable y alterar estructuras locales para evadir chequeos de seguridad de la aplicación.
+   - **Vector para ataques de concurrencia:** Provee una región virtual vinculada a un archivo del sistema pero con la bandera `VM_MAYWRITE` habilitada en el VMA, requisito fundamental para vulnerabilidades de carrera como Dirty COW.
 
 ---
 
 ### Pregunta 9: Mitigación de Condiciones de Carrera (`madvise` y COW)
 **Enunciado:** *¿Cómo previene el kernel actual condiciones de carrera concurrentes entre `madvise(MADV_DONTNEED)` y escrituras sobre páginas mapeadas privadas?*
 
-#### Respuesta y Fundamentación Técnica Rigurosa:
+#### Respuesta Técnica:
 
-La prevención de condiciones de carrera entre la invalidación de páginas (`MADV_DONTNEED`) y las operaciones de escritura concurrentes (vía CPU directa o mediante `get_user_pages`) se resolvió en el kernel contemporáneo a través de una reforma profunda en los mecanismos de sincronización de memoria virtual:
+La contención determinista de carreras entre invalidación de páginas y escrituras concurrentes se resolvió en kernels modernos mediante:
 
-```mermaid
-flowchart LR
-    A["Hilo 1: madvise(MADV_DONTNEED)"] -->|Intenta limpiar PTE| B["Cerradura de Tabla de Páginas (PTL)"]
-    C["Hilo 2: Escritura GUP / MOV"] -->|Intenta romper COW| B
-    B -->|Serialización Determinista| D{"¿Página marcada FOLL_COW?"}
-    D -->|Sí| E[Garantiza copia privada anónima exclusiva]
-    D -->|No| F[Reintenta fallo con banderas seguras]
-```
-
-#### Mecanismos de Protección en el Kernel Moderno:
-
-1. **La Bandera `FOLL_COW` en `mm/gup.c`:**
-   - Históricamente, el kernel perdía la noción de si una página ya había sido duplicada por COW al reintentar un fallo tras `madvise()`.
-   - El kernel moderno introdujo la bandera de rastreo `FOLL_COW`. Cuando `get_user_pages()` necesita escribir sobre una página privada, marca internamente `FOLL_COW`.
-   - Al resolverse el fallo en `faultin_page()`, el kernel comprueba no solo que la página esté presente, sino que pertenezca a una **página anónima exclusiva** (`PageAnon(page) && PageAnonExclusive(page)`). Si `madvise()` descartó la página, la condición falla de manera segura y el kernel vuelve a disparar el COW completo, sin jamás escribir en la página del Page Cache.
-
-2. **Cerraduras de Página de Granularidad Fina (PTL - Page Table Locks):**
-   - La modificación de las entradas PTE tanto en `zap_pte_range()` (invocado por `madvise`) como en `do_wp_page()` está estrictamente serializada mediante el spinlock de la tabla de páginas (`pte_lockptr(mm, pmd)`).
-   - Ningún hilo puede alternar los bits de presencia o escritura en la PTE de manera intercalada sin adquirir previamente el cerrojo de la tabla correspondiente.
-
-3. **Aislamiento de Páginas Exclusivas (`PageAnonExclusive` en Linux 5.16+):**
-   - En kernels 5.16 y 6.x+, se consolidó el bit `PageAnonExclusive`. Este bit certifica que ningún otro hilo o descriptor tiene referencias compartidas al marco físico. Si `madvise(MADV_DONTNEED)` remueve la página, la exclusividad se invalida de inmediato, bloqueando cualquier intento de escritura concurrente antes de que la memoria sea reasignada.
+1. **Bandera `FOLL_COW` en GUP:** En operaciones forzadas sobre memoria privada (`get_user_pages`), el kernel exige la presencia de `FOLL_COW` y verifica explícitamente que la página resultante pertenezca a una copia anónima exclusiva (`PageAnonExclusive`). Si `madvise()` descartó la página, la verificación falla y el ciclo de fallo se reinicia sin escribir jamás en la caché compartida.
+2. **Cerraduras PTL (Page Table Locks):** Toda modificación a las entradas de las tablas de páginas en `zap_pte_range()` y en `do_wp_page()` está serializada por el spinlock de la tabla de páginas (`pte_lockptr`), impidiendo estados inconsistentes durante la conmutación de bits.
+3. **Validación de Exclusividad (`PageAnonExclusive` en Linux 5.16+):** Garantiza que ninguna página privada pueda ser escrita si existen referencias cruzadas activas.
 
 ---
 
 ### Pregunta 10: Aislamiento de Memoria y Paginación Multinivel
 **Enunciado:** *¿Qué papel juegan las estructuras de descriptores de página (`struct page`), tablas de páginas (PGD, P4D, PUD, PMD, PTE) y los bits de protección de la MMU (NX, R/W, U/S) en la contención de inyecciones de código malicioso en memoria mapeada?*
 
-#### Respuesta y Fundamentación Técnica Rigurosa:
+#### Respuesta Técnica:
 
-El aislamiento de memoria y la prevención de ejecución de código arbitrario se sostienen en la sinergia indisoluble entre las **estructuras de datos del Kernel** y las **capacidades de verificación a nivel de silicio de la MMU**:
+El aislamiento se logra combinando las estructuras del sistema operativo con los controles de hardware de la CPU:
 
-```
-ESTRUCTURAS KERNEL                  TABLAS MULTINIVEL x86_64              BITS DE HARDWARE (MMU)
-+------------------------+          +-------------------------+          +------------------------+
-| struct mm_struct       |          | CR3 (Registro Base)     |          | Bit 0: Present (P)     |
-|   |                    |          |   |                     |          | Bit 1: Read/Write (R/W)|
-|   v                    |  =====>  |   v PGD (512 Entradas)  |  =====>  | Bit 2: User/Super (U/S)|
-| struct vm_area_struct  |          |   v P4D (Nivel 4)       |          | Bit 6: Dirty (D)       |
-|   |                    |          |   v PUD (Nivel 3)       |          | Bit 63: No-Execute(NX) |
-|   v                    |          |   v PMD (Nivel 2)       |          +------------------------+
-| struct page (Marco RAM)|          |   v PTE (Página 4 KB)   |
-+------------------------+          +-------------------------+
-```
+1. **Estructuras de Kernel:**
+   - `struct mm_struct`: Representa el mapa de memoria del proceso; su puntero `pgd` se carga en el registro **CR3** en cada cambio de contexto.
+   - `struct vm_area_struct`: Mantiene las políticas lógicas del segmento (`VM_READ`, `VM_WRITE`, `VM_EXEC`).
+   - `struct page`: Rastrea el marco de memoria física y sus referencias (`_refcount`) para evitar vulnerabilidades de tipo *Use-After-Free*.
 
-#### 1. Estructuras de Descriptores de Kernel:
-- **`struct mm_struct`:** Representa el contexto de memoria completo del proceso. Su puntero `pgd` se carga en el registro **CR3** de la CPU durante cada cambio de contexto (`switch_mm()`), delimitando de forma estricta qué tablas de páginas puede consultar la MMU.
-- **`struct vm_area_struct` (VMA):** Mantiene la política de seguridad abstracta en software (`vma->vm_flags`). Define si un segmento de memoria puede ser ejecutado (`VM_EXEC`), escrito (`VM_WRITE`) o leído (`VM_READ`).
-- **`struct page`:** Rastrea el marco de memoria física (RAM). Su campo `_refcount` previene ataques de liberación prematura (*Use-After-Free*), y sus banderas (`PG_reserved`, `PG_locked`) garantizan que páginas confidenciales no sean desplazadas al swap ni alteradas mientras están en tránsito de E/S.
+2. **Jerarquía Multinivel (PGD -> P4D -> PUD -> PMD -> PTE):** Estructura jerárquica con **herencia de permisos restrictivos**: si un nivel superior marca una región como solo lectura o no ejecutable, la MMU aplica la restricción a todas las subpáginas.
 
-#### 2. Jerarquía Multinivel de Tablas de Páginas (PGD -> P4D -> PUD -> PMD -> PTE):
-- La arquitectura de paginación de 4 o 5 niveles permite una traducción jerárquica y dispersa.
-- **Herencia de Permisos en Cascada:** Si un nivel superior (e.g. PMD o PUD) tiene configurado el bit de solo lectura (`R/W = 0`) o No-Ejecutable (`NX = 1`), **la MMU aplica esa restricción a todas las páginas subordinadas**, haciendo imposible que una subpágina PTE eluda la política general del segmento.
-
-#### 3. Bits de Protección de Hardware en la MMU y Contención de Inyecciones:
-1. **Bit NX (No-Execute / XD - Execute Disable, Bit 63):**
-   - Marca la región de datos mapeada por `mmap()` como estrictamente **no ejecutable**.
-   - Si un atacante logra escribir *shellcode* en un búfer mapeado con `mmap()` e intenta redirigir el puntero de instrucción `%rip` hacia esa dirección, la MMU intercepta inmediatamente el intento de decodificación de instrucción y dispara una **Excepción de Protección General (`#GP`) o Fallo de Página con código de instrucción (`Instruction Fetch Fault`)**, abortando el proceso con `SIGSEGV` antes de que se ejecute un solo opcode malicioso (principio **W^X / DEP**).
-2. **Bit U/S (User / Supervisor, Bit 2):**
-   - Configurado en `0` para el espacio de kernel y en `1` para el espacio de usuario.
-   - Si código en Ring 3 intenta acceder a una dirección física del kernel mapeada en la tabla, la MMU bloquea el acceso a nivel de silicio sin importar los punteros que posea el proceso.
-3. **Mecanismos de CPU Complementarios (SMEP y SMAP):**
-   - **SMEP (Supervisor Mode Execution Prevention):** Impide que el código del kernel (Ring 0) ejecute instrucciones ubicadas en páginas marcadas como de usuario (`U/S = 1`), frustrando técnicas de ataque como *ret2usr*.
-   - **SMAP (Supervisor Mode Access Prevention):** Impide que el kernel lea o escriba inadvertidamente en memoria de usuario a menos que active explícitamente la bandera `AC` mediante la instrucción `STAC`, previniendo que llamadas `mmap()` engañen al núcleo para sobreescribir datos del sistema.
+3. **Bits de Protección de Hardware en la MMU:**
+   - **Bit NX (No-Execute / XD, Bit 63):** Marca las páginas de datos mapeadas como no ejecutables. Si un atacante inyecta *shellcode* e intenta saltar a él, la CPU dispara una excepción de hardware (#GP o #PF por decodificación de instrucción) y aborta con `SIGSEGV` (principio W^X / DEP).
+   - **Bit R/W (Bit 1):** Controla permisos de lectura/escritura a nivel de silicio; previene alteraciones si `R/W = 0`.
+   - **Bit U/S (User/Supervisor, Bit 2):** Impide que el código en Ring 3 acceda a páginas del kernel.
+   - **Protecciones CPU Complementarias (SMEP y SMAP):** SMEP impide que el kernel ejecute código en páginas de usuario (mitiga *ret2usr*); SMAP impide que el kernel lea/escriba en páginas de usuario sin autorización explícita.
 
 ---
 
